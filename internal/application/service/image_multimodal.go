@@ -50,6 +50,25 @@ const (
 		"</instructions>"
 )
 
+// acceptVLMCaption applies the repetition-loop guard to a caption produced for
+// one image. It returns the caption to persist and whether the model looped
+// (in which case the caption is dropped).
+//
+// A figure that drives the OCR path into a repetition loop drives the caption
+// path there too: both call the same VLM with the same image. An unchecked
+// looping caption becomes its own image_caption chunk and reaches the vector
+// store, so it is filtered with the same predicate as the OCR text.
+func acceptVLMCaption(caption string) (string, bool) {
+	trimmed := strings.TrimSpace(caption)
+	if trimmed == "" {
+		return "", false
+	}
+	if isDegenerateOCRText(trimmed) {
+		return "", true
+	}
+	return trimmed, false
+}
+
 func buildVLMCaptionPrompt(ctx context.Context, cfg types.VLMConfig) string {
 	language := strings.TrimSpace(cfg.DescriptionLanguage)
 	if language == "" {
@@ -302,10 +321,16 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 	if capErr != nil {
 		logger.Warnf(ctx, "[ImageMultimodal] Caption failed for %s: %v", payload.ImageURL, capErr)
 		imgOut["caption_error"] = capErr.Error()
-	} else if caption != "" {
-		imageInfo.Caption = caption
-		imgOut["caption_chars"] = len([]rune(caption))
-		imgOut["caption_preview"] = previewText(caption, 200)
+	} else {
+		accepted, looped := acceptVLMCaption(caption)
+		if looped {
+			logger.Warnf(ctx, "[ImageMultimodal] Caption looked like a repetition loop, discarded for %s", payload.ImageURL)
+			imgOut["caption_skipped"] = "repetition_loop"
+		} else if accepted != "" {
+			imageInfo.Caption = accepted
+			imgOut["caption_chars"] = len([]rune(accepted))
+			imgOut["caption_preview"] = previewText(accepted, 200)
+		}
 	}
 
 	// Build child chunks for OCR and caption results

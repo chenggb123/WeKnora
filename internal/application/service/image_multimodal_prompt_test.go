@@ -61,3 +61,43 @@ func TestVLMOCRPromptExcludesCustomInstructions(t *testing.T) {
 		t.Fatalf("caption prompt should still carry custom instructions: %s", caption)
 	}
 }
+
+// TestAcceptVLMCaption pins the caption-side repetition guard. The OCR and
+// caption paths share the same VLM and the same image, so a figure that drives
+// OCR into a repetition loop drives the caption there too; an unchecked looping
+// caption becomes its own image_caption chunk and reaches the vector store.
+func TestAcceptVLMCaption(t *testing.T) {
+	loop := strings.Repeat("$0.00 = 0.00$  ", 200)
+
+	cases := []struct {
+		name       string
+		caption    string
+		wantText   string
+		wantLooped bool
+	}{
+		{name: "empty caption", caption: "", wantText: "", wantLooped: false},
+		{name: "blank caption", caption: "   \n ", wantText: "", wantLooped: false},
+		{
+			name:       "repetition loop is dropped",
+			caption:    loop,
+			wantText:   "",
+			wantLooped: true,
+		},
+		{
+			name:       "normal caption is trimmed and kept",
+			caption:    "  缸体与飞轮壳结合面的应力分布云图，红色区域为高应力区。  ",
+			wantText:   "缸体与飞轮壳结合面的应力分布云图，红色区域为高应力区。",
+			wantLooped: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, looped := acceptVLMCaption(tc.caption)
+			if got != tc.wantText || looped != tc.wantLooped {
+				t.Errorf("acceptVLMCaption() = (%q, %v), want (%q, %v)",
+					got, looped, tc.wantText, tc.wantLooped)
+			}
+		})
+	}
+}

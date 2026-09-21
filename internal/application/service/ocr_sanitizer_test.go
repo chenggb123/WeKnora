@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -251,6 +252,231 @@ func TestIsKnownEmptyReply(t *testing.T) {
 			got := isKnownEmptyReply(tt.input)
 			if got != tt.want {
 				t.Errorf("isKnownEmptyReply(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSanitizeOCRText_DiscardsRepetitionLoops covers the degenerate outputs
+// vision models produce on non-text figures (FEA contour plots, diagrams).
+// Both OvisOCR2 and PaddleOCR-VL loop on the same image and run until
+// max_tokens, so the sanitizer is the single place that can stop the garbage
+// from becoming an image_ocr chunk. Every fixture mirrors a shape observed in
+// production: a repeated line, a repeated token group on one line, a tiny
+// cycling vocabulary, and a runaway repeated rune.
+func TestSanitizeOCRText_DiscardsRepetitionLoops(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "repeated identical line",
+			input: strings.Repeat("$\\text{H}_2\\text{SO}_4$\n\n", 60),
+		},
+		{
+			name:  "repeated token group without newlines",
+			input: strings.Repeat("$0.00 = 0.00$  ", 200),
+		},
+		{
+			name: "small cycling token vocabulary",
+			input: strings.Repeat(
+				"08.8 = 05A + 2T_ST = 05A + 04.2 = 1A + 2T_A = 2A + 00.4 = 0A + 00.0 = 2A + ",
+				20,
+			),
+		},
+		{
+			name:  "runaway repeated rune",
+			input: "0." + strings.Repeat("0", 400),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if len(tc.input) < degenerateMinBytes {
+				t.Fatalf("fixture is %d bytes, below degenerateMinBytes=%d; it would not exercise the guard",
+					len(tc.input), degenerateMinBytes)
+			}
+			got := sanitizeOCRText(tc.input)
+			if got != "" {
+				preview := got
+				if len(preview) > 60 {
+					preview = preview[:60]
+				}
+				t.Fatalf("sanitizeOCRText() kept a repetition loop (%d bytes): %q", len(got), preview)
+			}
+		})
+	}
+}
+
+// TestSanitizeOCRText_KeepsLegitimateContent locks in the conservative side of
+// the guard: real OCR output, however long or terse, must survive untouched.
+func TestSanitizeOCRText_KeepsLegitimateContent(t *testing.T) {
+	chineseProse := "缸体或飞轮壳维修时，维修后状态如下述方式进行检查。首先确认结合面无油污、无锈蚀，" +
+		"随后按对角线顺序分三次拧紧螺栓，扭矩依次递增到规定值。若发现局部变形超过允许范围，" +
+		"应重新加工配合面并复测平面度。胶线应连续均匀，不允许出现断胶或堆胶现象，" +
+		"涂胶后需在规定时间内完成装配，避免胶体表干影响密封效果。" +
+		"装配完成后进行气密性试验，保压期间压降不得超过工艺文件规定的上限。"
+
+	longTable := "| 序号 | 检查项 | 标准值 | 实测值 | 结论 |\n| --- | --- | --- | --- | --- |\n"
+	for i := 1; i <= 20; i++ {
+		longTable += fmt.Sprintf("| %d | 项目%d | 12.%02d | 12.%02d | 合格 |\n", i, i, i, i+1)
+	}
+
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{name: "long chinese prose", input: chineseProse},
+		{name: "long markdown table with distinct rows", input: longTable},
+		{name: "terse label pair", input: "Before  After  Add machining  chamfering  Add two ribs"},
+		{
+			// Short and repetitive, but below the size floor: terse labels are
+			// common on engineering drawings and must not be dropped.
+			name:  "short repetitive text below size floor",
+			input: "1  1  1  1  1  1  1  1",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeOCRText(tc.input); got == "" {
+				t.Fatalf("sanitizeOCRText() discarded legitimate content (%d bytes)", len(tc.input))
+			}
+		})
+	}
+}
+
+// variedOCRSample is genuinely non-repetitive OCR output used to prove the
+// heuristics do not fire on real documents.
+var variedOCRSample = strings.Join([]string{
+	"第 1 项：结合面平面度检查，标准值 0.05 mm，实测 0.03 mm，判定合格。",
+	"第 2 项：螺栓扭矩复核，标准值 210 N·m，实测 208 N·m，记录于检验单 A-17。",
+	"第 3 项：胶线连续性目视检查，未见断胶与堆胶，符合工艺文件 QG-2024-11 要求。",
+	"第 4 项：飞轮壳与缸体配合间隙测量，塞尺 0.10 mm 不入，满足装配条件。",
+	"第 5 项：加强筋焊接质量检查，焊缝饱满无咬边，按目视标准判定可用。",
+	"第 6 项：表面清洁度确认，使用无水乙醇擦拭后静置五分钟，无残留油膜。",
+	"第 7 项：气密性试验，保压五分钟压降 0.002 MPa，低于允许上限值。",
+	"第 8 项：复装后运转测试，怠速运行十分钟无异响、无渗漏现象发生。",
+	"第 9 项：检验人员签字确认，班组长复核通过，相关记录已归档保存。",
+	"第 10 项：不合格品处置流程说明，需填写偏离单并提交工程师评审。",
+}, "\n")
+
+func TestIsDegenerateOCRText(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{
+			name:  "empty",
+			input: "",
+			want:  false,
+		},
+		{
+			// Below the size floor nothing is judged, so terse-but-repetitive
+			// labels survive.
+			name:  "below size floor is never degenerate",
+			input: strings.Repeat("$x$ ", 50),
+			want:  false,
+		},
+		{
+			name:  "repeated line",
+			input: strings.Repeat("same line here\n", 40),
+			want:  true,
+		},
+		{
+			name:  "varied prose is not degenerate",
+			input: variedOCRSample,
+			want:  false,
+		},
+		{
+			name:  "repeated rune",
+			input: strings.Repeat("a", 500),
+			want:  true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isDegenerateOCRText(tc.input); got != tc.want {
+				t.Errorf("isDegenerateOCRText() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasLongRepeatedRuneRun(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{name: "no run", input: "abcabcabcabc", want: false},
+		{name: "one below threshold", input: strings.Repeat("a", degenerateMaxRuneRun-1), want: false},
+		{name: "at threshold", input: strings.Repeat("a", degenerateMaxRuneRun), want: true},
+		{
+			// Whitespace breaks the run, so two 60-rune runs do not add up.
+			name:  "spaces reset the run counter",
+			input: strings.Repeat("a", 60) + " " + strings.Repeat("a", 60),
+			want:  false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasLongRepeatedRuneRun(tc.input); got != tc.want {
+				t.Errorf("hasLongRepeatedRuneRun() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasDominantRepeatedLine(t *testing.T) {
+	distinct := make([]string, 0, 10)
+	for i := 0; i < 10; i++ {
+		distinct = append(distinct, fmt.Sprintf("line number %d with distinct words", i))
+	}
+
+	cases := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{name: "no lines", input: "", want: false},
+		{name: "fewer lines than the minimum", input: strings.Repeat("x\n", degenerateMinLines-1), want: false},
+		{name: "one line dominates", input: strings.Repeat("x\n", 20), want: true},
+		{name: "distinct lines", input: strings.Join(distinct, "\n"), want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasDominantRepeatedLine(tc.input); got != tc.want {
+				t.Errorf("hasDominantRepeatedLine() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasDegenerateTokenUniqueness(t *testing.T) {
+	var varied []string
+	for i := 0; i < 60; i++ {
+		varied = append(varied, fmt.Sprintf("token%d", i))
+	}
+
+	cases := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{name: "below token floor", input: strings.Repeat("a b c ", 10), want: false},
+		{name: "tiny cycling vocabulary", input: strings.Repeat("a b c ", 40), want: true},
+		{name: "distinct tokens", input: strings.Join(varied, " "), want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasDegenerateTokenUniqueness(tc.input); got != tc.want {
+				t.Errorf("hasDegenerateTokenUniqueness() = %v, want %v", got, tc.want)
 			}
 		})
 	}
