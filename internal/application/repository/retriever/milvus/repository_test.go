@@ -3,6 +3,7 @@ package milvus
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -99,4 +100,16 @@ func TestUpdateChunkEnabledStatusInCollectionsIgnoresExtendedPrefix(t *testing.T
 	)
 	require.NoError(t, err)
 	require.Equal(t, []string{"weknora_embeddings_1024"}, seen)
+}
+
+func TestIsMilvusCollectionNotFound(t *testing.T) {
+	require.False(t, isMilvusCollectionNotFound(nil))
+	require.False(t, isMilvusCollectionNotFound(errors.New("connection refused")))
+
+	// Exact error surfaced by the Milvus client when the collection was dropped
+	// (or the metadata was reset) while a delete is in flight.
+	err := errors.New("Failed to get collection id: collection not found[database=default][collection=weknora_embeddings_1024]")
+	require.True(t, isMilvusCollectionNotFound(err))
+	require.True(t, isMilvusCollectionNotFound(fmt.Errorf("failed to delete by knowledge IDs: %w", err)))
+	require.True(t, isMilvusCollectionNotFound(errors.New("CollectionNotFound")))
 }

@@ -392,6 +392,19 @@ func (m *milvusRepository) BatchSave(ctx context.Context,
 	return nil
 }
 
+// isMilvusCollectionNotFound reports whether the Milvus error means the target
+// collection does not exist. Collections are created lazily on the first write,
+// so a missing one is an expected state (e.g. right after a metadata reset) and
+// delete operations must stay idempotent instead of failing the caller.
+func isMilvusCollectionNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "collection not found") ||
+		strings.Contains(msg, "collectionnotfound")
+}
+
 // DeleteByChunkIDList removes points from the collection based on chunk IDs
 func (m *milvusRepository) DeleteByChunkIDList(ctx context.Context, chunkIDList []string, dimension int, knowledgeType string) error {
 	log := logger.GetLogger(ctx)
@@ -407,6 +420,10 @@ func (m *milvusRepository) DeleteByChunkIDList(ctx context.Context, chunkIDList 
 	deleteOpt.WithStringIDs(fieldChunkID, chunkIDList)
 	_, err := m.client.Delete(ctx, deleteOpt)
 	if err != nil {
+		if isMilvusCollectionNotFound(err) {
+			log.Warnf("[Milvus] Collection %s does not exist, skipping delete by chunk IDs", collectionName)
+			return nil
+		}
 		log.Errorf("[Milvus] Failed to delete by chunk IDs: %v", err)
 		return fmt.Errorf("failed to delete by chunk IDs: %w", err)
 	}
@@ -432,6 +449,10 @@ func (m *milvusRepository) DeleteByKnowledgeIDList(ctx context.Context,
 	deleteOpt.WithStringIDs(fieldKnowledgeID, knowledgeIDList)
 	_, err := m.client.Delete(ctx, deleteOpt)
 	if err != nil {
+		if isMilvusCollectionNotFound(err) {
+			log.Warnf("[Milvus] Collection %s does not exist, skipping delete by knowledge IDs", collectionName)
+			return nil
+		}
 		log.Errorf("[Milvus] Failed to delete by knowledge IDs: %v", err)
 		return fmt.Errorf("failed to delete by knowledge IDs: %w", err)
 	}
@@ -457,6 +478,10 @@ func (m *milvusRepository) DeleteBySourceIDList(ctx context.Context,
 	deleteOpt.WithStringIDs(fieldSourceID, sourceIDList)
 	_, err := m.client.Delete(ctx, deleteOpt)
 	if err != nil {
+		if isMilvusCollectionNotFound(err) {
+			log.Warnf("[Milvus] Collection %s does not exist, skipping delete by source IDs", collectionName)
+			return nil
+		}
 		log.Errorf("[Milvus] Failed to delete by source IDs: %v", err)
 		return fmt.Errorf("failed to delete by source IDs: %w", err)
 	}
