@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/textmetrics"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
@@ -27,6 +28,41 @@ type OpenAIEmbedder struct {
 	customHeaders             map[string]string
 	supportsDimensionOverride bool
 	EmbedderPooler
+}
+
+// maxInputTokens is the token window the pre-flight diagnostic compares
+// against. It matches the common ceiling for OpenAI-compatible embedding
+// models (OpenAI text-embedding-3-*, Bailian text-embedding-v3/v4). It is a
+// reporting threshold only: it never blocks, truncates, or rewrites a request.
+const maxInputTokens = 8192
+
+// embeddingInputStat is the per-input diagnostic computed before a batch is
+// sent. Tokens is an approximation (see internal/textmetrics), not
+// a tokenizer count.
+type embeddingInputStat struct {
+	Tokens     int
+	Chars      int
+	Lang       string
+	Empty      bool
+	OverWindow bool
+}
+
+// classifyEmbeddingInput estimates the token footprint of one embedding input
+// so the caller can report over-window inputs in the unit the provider actually
+// enforces. It performs no I/O and no logging, so it can be unit tested without
+// an HTTP server.
+func classifyEmbeddingInput(text string, maxTokens int) embeddingInputStat {
+	stat := embeddingInputStat{Chars: len(text)}
+	if text == "" {
+		stat.Empty = true
+		return stat
+	}
+	stat.Lang = textmetrics.DetectLanguage(text)
+	stat.Tokens = textmetrics.ApproxTokenCount(text, stat.Lang)
+	if maxTokens > 0 && stat.Tokens > maxTokens {
+		stat.OverWindow = true
+	}
+	return stat
 }
 
 // OpenAIEmbedRequest represents an OpenAI embedding request
@@ -182,28 +218,51 @@ func (e *OpenAIEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 	logger.GetLogger(ctx).Debugf("OpenAIEmbedder BatchEmbed: model=%s, input_count=%d, truncate_tokens=%d",
 		e.modelName, len(texts), e.truncatePromptTokens)
 
-	// Check for invalid input lengths and log details
-	hasInvalidLength := false
+	// Diagnostics only — the request is sent either way. Two cases are worth
+	// reporting: an empty input, which the provider always rejects, and an
+	// input past the model's token window, which it may reject or silently
+	// truncate.
+	//
+	// Length is reported as an estimated TOKEN count, never as len(text). A
+	// byte count compared against 8192 tokens logged a false
+	// "INVALID length=16262 (must be [1, 8192])" for every long CJK chunk and
+	// buried real failures in noise: 16262 bytes of Chinese is roughly 5.4k
+	// tokens, comfortably inside an 8192-token window.
+	emptyInputs := 0
+	overWindowInputs := 0
 	for i, text := range texts {
-		textLen := len(text)
+		stat := classifyEmbeddingInput(text, maxInputTokens)
+
 		textPreview := text
 		if len(textPreview) > 200 {
 			textPreview = textPreview[:200] + "..."
 		}
 
-		// Log warning if length is outside valid range [1, 8192]
-		if textLen == 0 || textLen > 8192 {
-			hasInvalidLength = true
-			logger.GetLogger(ctx).Errorf("OpenAIEmbedder BatchEmbed input[%d]: INVALID length=%d (must be [1, 8192]), preview=%s",
-				i, textLen, textPreview)
-		} else {
-			logger.GetLogger(ctx).Debugf("OpenAIEmbedder BatchEmbed input[%d]: length=%d, preview=%s",
-				i, textLen, textPreview)
+		switch {
+		case stat.Empty:
+			emptyInputs++
+			logger.GetLogger(ctx).Errorf(
+				"OpenAIEmbedder BatchEmbed input[%d]: empty input, the provider will reject it", i)
+		case stat.OverWindow:
+			overWindowInputs++
+			logger.GetLogger(ctx).Warnf(
+				"OpenAIEmbedder BatchEmbed input[%d]: ~%d tokens (chars=%d lang=%s) exceeds the %d-token window; the provider may reject or truncate it, preview=%s",
+				i, stat.Tokens, stat.Chars, stat.Lang, maxInputTokens, textPreview)
+		default:
+			logger.GetLogger(ctx).Debugf(
+				"OpenAIEmbedder BatchEmbed input[%d]: ~%d tokens (chars=%d lang=%s), preview=%s",
+				i, stat.Tokens, stat.Chars, stat.Lang, textPreview)
 		}
 	}
 
-	if hasInvalidLength {
-		logger.GetLogger(ctx).Errorf("OpenAIEmbedder BatchEmbed: Found invalid input lengths, this will likely cause API error")
+	if emptyInputs > 0 {
+		logger.GetLogger(ctx).Errorf(
+			"OpenAIEmbedder BatchEmbed: %d empty input(s); the provider will reject the request", emptyInputs)
+	}
+	if overWindowInputs > 0 {
+		logger.GetLogger(ctx).Warnf(
+			"OpenAIEmbedder BatchEmbed: %d input(s) exceed the estimated %d-token window and may be rejected or truncated",
+			overWindowInputs, maxInputTokens)
 	}
 
 	// Send request (passing jsonData instead of constructing http.Request)
