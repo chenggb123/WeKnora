@@ -18,3 +18,10 @@ cli/acceptance/testdata/**/*.json text eol=lf
 
 # Unified diffs use a space to mark empty context lines.
 patches/browserskill/*.patch whitespace=-blank-at-eol
+# Build scripts parse these with bash tools that treat a trailing CR as data:
+# `awk '{print $2}' go.mod` and `read ... checksum` over the license source
+# manifest. A Windows checkout with core.autocrlf=true otherwise breaks the
+# image build with "expected v1.10.0, got v1.10.0" / "Invalid source checksum".
+go.mod text eol=lf
+go.sum text eol=lf
+licenses/sources/*.tsv text eol=lf
