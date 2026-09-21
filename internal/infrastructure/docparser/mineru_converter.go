@@ -32,12 +32,18 @@ var (
 // MinerUReader calls a self-hosted MinerU API to read/convert documents.
 type MinerUReader struct {
 	endpoint      string
-	backend       string // "pipeline", "vlm-*", "hybrid-*"
-	vlmServerURL  string // vLLM server URL for vlm-http-client / hybrid-http-client
+	backend       string // legacy backend (MinerU <= 3.x): "pipeline", "vlm-*", "hybrid-*"
+	vlmServerURL  string // legacy: vLLM server URL for vlm-http-client / hybrid-http-client
 	formulaEnable bool
 	tableEnable   bool
 	parseMethod   string
 	language      string
+
+	// MinerU >= 4.0 (V1 API) settings.
+	apiKey     string // optional bearer key when the service runs with --api-key
+	tier       string // flash / basic / standard / advanced
+	apiVersion string // auto (default), v1 or legacy
+	pageRange  string // optional 1-based page range, e.g. "1-5,8,r3-r1" or "all"
 }
 
 // NewMinerUReader creates a reader from ParserEngineOverrides.
@@ -56,6 +62,10 @@ func NewMinerUReader(overrides map[string]string) *MinerUReader {
 		tableEnable:   parseBoolOr(overrides["mineru_enable_table"], true),
 		parseMethod:   types.ResolveMinerUParseMethod(overrides["mineru_parse_method"], legacyOCREnabled),
 		language:      stringOr(overrides["mineru_language"], "ch"),
+		apiKey:        strings.TrimSpace(overrides["mineru_api_key"]),
+		tier:          resolveMineruTier(overrides["mineru_tier"]),
+		apiVersion:    strings.ToLower(strings.TrimSpace(overrides["mineru_api_version"])),
+		pageRange:     strings.TrimSpace(overrides["mineru_page_range"]),
 	}
 	return c
 }
@@ -80,9 +90,21 @@ func (c *MinerUReader) Read(ctx context.Context, req *types.ReadRequest) (*types
 
 	logger.Infof(context.Background(), "[MinerU] Parsing file=%s size=%d via %s", req.FileName, len(content), c.endpoint)
 
-	mdContent, imagesB64, err := c.callFileParse(ctx, content, req.FileName, req.FileType)
-	if err != nil {
-		return nil, fmt.Errorf("MinerU file_parse: %w", err)
+	var mdContent string
+	var imagesB64 map[string]string
+	var err error
+	if c.resolveAPIVersion(ctx) == "v1" {
+		// MinerU >= 4.0 removed /file_parse; use the V1 upload -> job -> files flow.
+		client := newMineruV1Client(c.endpoint, c.apiKey, c.tier)
+		mdContent, imagesB64, err = client.parse(ctx, content, req.FileName, req.FileType, c.parseMethod, c.pageRange)
+		if err != nil {
+			return nil, fmt.Errorf("MinerU v1 parse: %w", err)
+		}
+	} else {
+		mdContent, imagesB64, err = c.callFileParse(ctx, content, req.FileName, req.FileType)
+		if err != nil {
+			return nil, fmt.Errorf("MinerU file_parse: %w", err)
+		}
 	}
 
 	// MinerU already returns markdown with embedded HTML blocks (e.g. <table>, <details>).
@@ -185,6 +207,22 @@ func parseMinerUFileParseResponse(respBody []byte, uploadFileName string) (strin
 		}
 	}
 	return "", nil, "", nil
+}
+
+// resolveAPIVersion decides which MinerU API the configured endpoint speaks.
+// Explicit mineru_api_version wins; otherwise the V1 health endpoint is probed
+// so MinerU >= 4.0 (V1) and <= 3.x (/file_parse) both keep working.
+func (c *MinerUReader) resolveAPIVersion(ctx context.Context) string {
+	switch c.apiVersion {
+	case "v1", "4", "v4":
+		return "v1"
+	case "legacy", "v3", "3", "file_parse":
+		return "legacy"
+	}
+	if probeMineruV1(ctx, c.endpoint, c.apiKey) {
+		return "v1"
+	}
+	return "legacy"
 }
 
 func (c *MinerUReader) callFileParse(
@@ -360,17 +398,48 @@ func validateMinerUOutboundURL(rawURL string) error {
 
 // PingMinerU checks if the self-hosted MinerU service is reachable.
 func PingMinerU(endpoint string) (bool, string) {
-	endpoint = strings.TrimRight(endpoint, "/")
+	return PingMinerUWithKey(endpoint, "")
+}
+
+// PingMinerUWithKey checks a self-hosted MinerU service. MinerU >= 4.0 exposes
+// /v1/health, while <= 3.x serves the FastAPI docs page next to /file_parse.
+func PingMinerUWithKey(endpoint, apiKey string) (bool, string) {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
 	if endpoint == "" {
 		return false, "未配置 MinerU 端点"
 	}
 	if err := validateMinerUOutboundURL(endpoint); err != nil {
 		return false, err.Error()
 	}
+
+	// MinerU 4.0+ (V1 API): /v1/health.
 	client := utils.NewSSRFSafeHTTPClient(utils.SSRFSafeHTTPClientConfig{
 		Timeout:      5 * time.Second,
 		MaxRedirects: 5,
 	})
+	healthReq, healthErr := http.NewRequest(http.MethodGet, endpoint+"/v1/health", nil)
+	if healthErr == nil {
+		if key := strings.TrimSpace(apiKey); key != "" {
+			healthReq.Header.Set("Authorization", "Bearer "+key)
+		}
+		if resp, err := client.Do(healthReq); err == nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var health struct {
+					Status string `json:"status"`
+				}
+				if json.Unmarshal(body, &health) == nil && strings.EqualFold(strings.TrimSpace(health.Status), "ok") {
+					return true, ""
+				}
+			}
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				return false, "MinerU API Key 无效"
+			}
+		}
+	}
+
+	// MinerU <= 3.x: FastAPI docs endpoint next to /file_parse.
 	resp, err := client.Get(endpoint + "/docs")
 	if err != nil {
 		return false, fmt.Sprintf("MinerU 服务不可达: %v", err)

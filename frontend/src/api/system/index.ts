@@ -111,6 +111,9 @@ export interface ParserEngineInfo {
 
 /** 解析引擎配置（引擎连接参数存空间；聊天附件解析策略在智能体中配置） */
 export type MinerUParseMethod = 'auto' | 'ocr' | 'txt'
+/** MinerU >= 4.0 quality tiers (replaced the legacy backend names). */
+export type MinerUTier = 'flash' | 'basic' | 'standard' | 'advanced'
+export type MinerUAPIVersion = 'auto' | 'v1' | 'legacy'
 
 export interface ParserEngineConfig {
   docreader_addr?: string
@@ -123,6 +126,10 @@ export interface ParserEngineConfig {
   mineru_enable_formula?: boolean | null
   mineru_enable_table?: boolean | null
   mineru_parse_method?: MinerUParseMethod
+  // MinerU >= 4.0 (V1 API)
+  mineru_tier?: MinerUTier
+  mineru_api_version?: MinerUAPIVersion
+  mineru_page_range?: string
   mineru_enable_ocr?: boolean | null
   mineru_language?: string
   // MinerU 云 API 参数

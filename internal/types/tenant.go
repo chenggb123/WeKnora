@@ -316,6 +316,10 @@ type ParserEngineConfig struct {
 	MinerUEnableFormula *bool  `json:"mineru_enable_formula,omitempty"`
 	MinerUEnableTable   *bool  `json:"mineru_enable_table,omitempty"`
 	MinerUParseMethod   string `json:"mineru_parse_method,omitempty"`
+	// MinerU >= 4.0 (V1 API): quality tier replaces the legacy backend names.
+	MinerUTier       string `json:"mineru_tier,omitempty"`        // flash / basic / standard / advanced
+	MinerUAPIVersion string `json:"mineru_api_version,omitempty"` // auto (default), v1 or legacy
+	MinerUPageRange  string `json:"mineru_page_range,omitempty"`  // e.g. "1-5,8,r3-r1" or "all"
 	// MinerUEnableOCR is retained for compatibility with configurations saved
 	// before parse_method supported auto/ocr/txt.
 	MinerUEnableOCR *bool  `json:"mineru_enable_ocr,omitempty"`
@@ -414,6 +418,15 @@ func (c *ParserEngineConfig) ToOverridesMap() map[string]string {
 	}
 	if c.MinerUParseMethod != "" || c.MinerUEnableOCR != nil {
 		m["mineru_parse_method"] = ResolveMinerUParseMethod(c.MinerUParseMethod, c.MinerUEnableOCR)
+	}
+	if c.MinerUTier != "" {
+		m["mineru_tier"] = c.MinerUTier
+	}
+	if c.MinerUAPIVersion != "" {
+		m["mineru_api_version"] = c.MinerUAPIVersion
+	}
+	if c.MinerUPageRange != "" {
+		m["mineru_page_range"] = c.MinerUPageRange
 	}
 	if c.MinerUEnableOCR != nil {
 		m["mineru_enable_ocr"] = fmt.Sprintf("%v", *c.MinerUEnableOCR)
